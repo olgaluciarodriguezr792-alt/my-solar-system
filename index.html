@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>3D 太阳系 - 终极全息版 (优化交互)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #020205; color: white; font-family: sans-serif; }
+        #videoElement { display: none; }
+        #ui-layer { position: absolute; top: 20px; left: 20px; z-index: 10; pointer-events: none; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
+        .highlight { color: #ff3366; font-size: 1.3em; font-weight: bold; }
+        .instruction { color: #00ffcc; font-size: 0.9em; line-height: 1.5; margin-bottom: 15px; }
+        
+        #cursor {
+            position: absolute; width: 30px; height: 30px; border: 2px dashed #00ffcc; 
+            border-radius: 50%; transform: translate(-50%, -50%); transition: border-color 0.2s, transform 0.2s;
+            pointer-events: none; z-index: 100; display: none; box-shadow: 0 0 15px rgba(0,255,204,0.5);
+            animation: spin 4s linear infinite;
+        }
+        #cursor::after { content: ''; position: absolute; top: 50%; left: 50%; width: 6px; height: 6px; background: #00ffcc; border-radius: 50%; transform: translate(-50%, -50%); box-shadow: 0 0 10px #00ffcc; }
+        @keyframes spin { 100% { transform: translate(-50%, -50%) rotate(360deg); } }
+    </style>
+    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="cursor"></div>
+
+    <div id="ui-layer">
+        <h2 id="statusText" style="color: #00ffcc;">系统加载中...</h2>
+        <div class="instruction">
+            【寻找目标】：单手移动准星 (触发子弹时间)。<br>
+            【锁定观察】：捏合锁定 (<b>公转停止</b>)，随后单手可环视星球。<br>
+            【全景导航】：双手张开，控制<b>上下左右平移</b>与拉伸缩放。<br>
+            【重置视角】：双手同时<b>握拳</b>，强制拉回上帝全景。
+        </div>
+        <p id="focusText">当前状态：<span style="color:#00ffcc; font-size: 1.2em;">全景巡航</span></p>
+    </div>
+    
+    <video id="videoElement" autoplay playsinline></video>
+
+    <script>
+        const videoElement = document.getElementById('videoElement');
+        const statusText = document.getElementById('statusText');
+        const focusText = document.getElementById('focusText');
+        const cursor = document.getElementById('cursor');
+
+        // ==========================================
+        // 1. 场景与视觉环境
+        // ==========================================
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x020205, 0.0006); 
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 8000);
+        camera.position.set(0, 150, 600); 
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        scene.add(new THREE.AmbientLight(0x444455)); 
+        const sunLight = new THREE.PointLight(0xffffff, 2.5, 4000);
+        scene.add(sunLight);
+        
+        const gridHelper = new THREE.GridHelper(3000, 100, 0x00ffcc, 0x001133);
+        gridHelper.position.y = -150; 
+        scene.add(gridHelper);
+
+        let dustSystem;
+        function createQuantumDust() {
+            const geom = new THREE.BufferGeometry();
+            const particleCount = 3000;
+            const pos = new Float32Array(particleCount * 3);
+            const colors = new Float32Array(particleCount * 3);
+            const color = new THREE.Color();
+            
+            for(let i=0; i<particleCount; i++) {
+                const r = 100 + Math.random() * 800;
+                const theta = Math.random() * 2 * Math.PI;
+                const y = (Math.random() - 0.5) * 400; 
+                pos[i*3] = r * Math.cos(theta);
+                pos[i*3+1] = y;
+                pos[i*3+2] = r * Math.sin(theta);
+                color.setHSL(0.5 + Math.random() * 0.1, 1.0, 0.6 + Math.random() * 0.4);
+                colors[i*3] = color.r; colors[i*3+1] = color.g; colors[i*3+2] = color.b;
+            }
+            geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            
+            const mat = new THREE.PointsMaterial({ size: 4, vertexColors: true, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending });
+            dustSystem = new THREE.Points(geom, mat);
+            scene.add(dustSystem);
+        }
+        createQuantumDust();
+
+        // ==========================================
+        // 2. 太阳系实体构建
+        // ==========================================
+        const masterGroup = new THREE.Group(); scene.add(masterGroup);
+        const offsetGroup = new THREE.Group(); masterGroup.add(offsetGroup);
+        const solarSystem = new THREE.Group(); offsetGroup.add(solarSystem);
+
+        const planetsData = []; 
+        const selectableHitboxes = []; 
+
+        const sun = new THREE.Mesh(new THREE.SphereGeometry(35, 32, 32), new THREE.MeshBasicMaterial({ color: 0xffdd44 }));
+        solarSystem.add(sun);
+        const sunHitbox = new THREE.Mesh(new THREE.SphereGeometry(60, 16, 16), new THREE.MeshBasicMaterial({ visible: false }));
+        sunHitbox.userData = { id: -2 };
+        sun.add(sunHitbox);
+        selectableHitboxes.push(sunHitbox);
+
+        const planetConfig = [
+            { name: '水星', size: 2, color: 0xaaaaaa, dist: 80, speed: 0.04 },
+            { name: '金星', size: 4, color: 0xe3bb76, dist: 130, speed: 0.03 },
+            { name: '地球', size: 4.5, color: 0x2266ff, dist: 180, speed: 0.02 },
+            { name: '火星', size: 3, color: 0xff4422, dist: 230, speed: 0.016 },
+            { name: '木星', size: 14, color: 0xc88b3a, dist: 330, speed: 0.008 },
+            { name: '土星', size: 11, color: 0xe2bf7d, dist: 430, speed: 0.006, hasRing: true },
+            { name: '天王星', size: 7, color: 0x4fd0e7, dist: 520, speed: 0.004 },
+            { name: '海王星', size: 7, color: 0x274687, dist: 600, speed: 0.002 }
+        ];
+
+        planetConfig.forEach((config, index) => {
+            const orbitObj = new THREE.Object3D();
+            solarSystem.add(orbitObj);
+
+            const mesh = new THREE.Mesh(new THREE.SphereGeometry(config.size, 32, 32), new THREE.MeshStandardMaterial({ color: config.color, roughness: 0.4 }));
+            mesh.position.x = config.dist;
+            orbitObj.add(mesh);
+
+            const wireMesh = new THREE.Mesh(new THREE.SphereGeometry(config.size * 1.3, 16, 16), new THREE.MeshBasicMaterial({ color: config.color, wireframe: true, transparent: true, opacity: 0.15 }));
+            mesh.add(wireMesh);
+
+            const hitbox = new THREE.Mesh(new THREE.SphereGeometry(config.size * 4 + 10, 16, 16), new THREE.MeshBasicMaterial({ visible: false }));
+            hitbox.userData = { id: index };
+            mesh.add(hitbox);
+            selectableHitboxes.push(hitbox);
+
+            if (config.hasRing) {
+                const ring = new THREE.Mesh(new THREE.RingGeometry(config.size * 1.5, config.size * 2.5, 64), new THREE.MeshStandardMaterial({ color: 0xc2a278, side: THREE.DoubleSide, transparent: true, opacity: 0.6 }));
+                ring.rotation.x = Math.PI / 2 + 0.2; mesh.add(ring);
+            }
+
+            const path = new THREE.Mesh(new THREE.RingGeometry(config.dist - 0.2, config.dist + 0.2, 128), new THREE.MeshBasicMaterial({ color: 0x00ffcc, side: THREE.DoubleSide, transparent: true, opacity: 0.1 }));
+            path.rotation.x = Math.PI / 2; solarSystem.add(path);
+
+            planetsData.push({ name: config.name, dist: config.dist, orbitObj: orbitObj, mesh: mesh, wireMesh: wireMesh, speed: config.speed });
+        });
+
+        // ==========================================
+        // 3. 手势逻辑与状态机
+        // ==========================================
+        const raycaster = new THREE.Raycaster();
+        let targetScale = 1, targetRotation = {x: 0, y: 0, z: 0};
+        let targetPan = {x: 0, y: 0}; // 新增：单独的平移控制器
+        
+        let globalTimeSpeed = 1, targetTimeSpeed = 1; 
+        const responsiveness = 0.05; 
+        let isLocked = false, focusIndex = -1, hoveredPlanetIndex = -1; 
+
+        // 检测手掌是否握拳
+        function isHandFist(hand) {
+            const getDist = (p1, p2) => Math.hypot(hand[p1].x - hand[p2].x, hand[p1].y - hand[p2].y);
+            const indexCurled = getDist(8, 0) < getDist(5, 0);
+            const middleCurled = getDist(12, 0) < getDist(9, 0);
+            const ringCurled = getDist(16, 0) < getDist(13, 0);
+            const pinkyCurled = getDist(20, 0) < getDist(17, 0);
+            return indexCurled && middleCurled && ringCurled && pinkyCurled;
+        }
+
+        function onResults(results) {
+            if (results.multiHandLandmarks) {
+                const hands = results.multiHandLandmarks;
+
+                // 【优先判定：双手握拳解锁】
+                if (hands.length === 2 && isLocked) {
+                    if (isHandFist(hands[0]) && isHandFist(hands[1])) {
+                        isLocked = false;
+                        focusIndex = -1;
+                        
+                        // 【极其重要】：解锁时强制拉回中心上帝视角
+                        targetScale = 1;
+                        targetPan = {x: 0, y: 0};
+                        targetRotation = {x: 0, y: 0, z: 0};
+                        
+                        statusText.innerHTML = "【已解锁】强制拉回宏大视角！";
+                        focusText.innerHTML = `当前状态：<span style="color:#00ffcc; font-size: 1.2em;">全景巡航</span>`;
+                        return; 
+                    }
+                }
+
+                if (isLocked) {
+                    cursor.style.display = 'none'; 
+                    targetTimeSpeed = 1; 
+                    const targetName = focusIndex === -2 ? "太阳" : planetsData[focusIndex].name;
+                    
+                    if (hands.length === 1) {
+                        // 锁定后，单手可以旋转观察这颗静止的星球
+                        targetRotation.y = (hands[0][9].x - 0.5) * 2.0;
+                        targetRotation.x = (hands[0][9].y - 0.5) * 2.0;
+                        statusText.innerHTML = `正在观测：<span class="highlight">${targetName}</span> | 单手环视中`;
+                    } 
+                    else if (hands.length === 2) {
+                        const h1 = hands[0][9], h2 = hands[1][9]; 
+                        targetScale = Math.max(0.3, Math.hypot(h2.x-h1.x, h2.y-h1.y) * 6);
+                        statusText.innerHTML = `正在观测：<span class="highlight">${targetName}</span> | 双手缩放中`;
+                    }
+                } 
+                else {
+                    if (hands.length === 2) {
+                        cursor.style.display = 'none'; 
+                        targetTimeSpeed = 1; 
+                        
+                        const h1 = hands[0][9], h2 = hands[1][9]; 
+                        
+                        // 双手拉伸缩放
+                        targetScale = Math.max(0.3, Math.hypot(h2.x-h1.x, h2.y-h1.y) * 4);
+                        
+                        // 【新增：双手上下左右平移】反转坐标轴，符合类似拖拽的直觉
+                        targetPan.x = -((h1.x + h2.x)/2 - 0.5) * 800;
+                        targetPan.y = ((h1.y + h2.y)/2 - 0.5) * 800;
+                        
+                        // 稍微带一点透视旋转增加立体感，但不完全由双手控制
+                        targetRotation.z = -Math.atan2(h2.y-h1.y, h2.x-h1.x) * 0.5;
+                        
+                        statusText.innerText = "全景模式：平移与缩放";
+                    } 
+                    else if (hands.length === 1) {
+                        const hand = hands[0];
+                        const indexFinger = hand[8], thumb = hand[4]; 
+                        
+                        // 【移除】未锁定时单手旋转视角的代码，让宇宙完全静止，大幅提升瞄准精度！
+                        
+                        targetTimeSpeed = 0.02; // 子弹时间
+                        
+                        const screenX = (1 - indexFinger.x) * window.innerWidth;
+                        const screenY = indexFinger.y * window.innerHeight;
+                        cursor.style.display = 'block';
+                        cursor.style.left = screenX + 'px';
+                        cursor.style.top = screenY + 'px';
+
+                        const mouseVector = new THREE.Vector2((screenX / window.innerWidth) * 2 - 1, -(screenY / window.innerHeight) * 2 + 1);
+                        raycaster.setFromCamera(mouseVector, camera);
+                        const intersects = raycaster.intersectObjects(selectableHitboxes);
+
+                        if (intersects.length > 0) {
+                            cursor.style.borderColor = "#ff3366";
+                            cursor.style.transform = "translate(-50%, -50%) scale(1.5)"; 
+                            const hitId = intersects[0].object.userData.id;
+                            hoveredPlanetIndex = hitId !== undefined ? hitId : -2; 
+                            const hoverName = hoveredPlanetIndex === -2 ? "太阳" : planetsData[hoveredPlanetIndex].name;
+                            statusText.innerHTML = `【子弹时间】目标：<span style="color:#ff3366">${hoverName}</span>，捏合锁定！`;
+                        } else {
+                            cursor.style.borderColor = "#00ffcc";
+                            cursor.style.transform = "translate(-50%, -50%) scale(1)";
+                            hoveredPlanetIndex = -1;
+                            statusText.innerText = "【子弹时间】移动准星寻找目标";
+                        }
+
+                        const pinchDistance = Math.hypot(indexFinger.x - thumb.x, indexFinger.y - thumb.y);
+                        if (pinchDistance < 0.08 && hoveredPlanetIndex !== -1) {
+                            isLocked = true;
+                            focusIndex = hoveredPlanetIndex;
+                            const name = focusIndex === -2 ? "太阳" : planetsData[focusIndex].name;
+                            focusText.innerHTML = `当前状态：<span class="highlight">已锁定 ${name}</span><br><span style="font-size:0.6em;color:#fff;">公转已强制暂停</span>`;
+                        }
+                    }
+                }
+            } else {
+                cursor.style.display = 'none';
+                targetTimeSpeed = 1; 
+                statusText.innerText = "【待机】全景自动演化中...";
+            }
+        }
+
+        // ==========================================
+        // 4. 动画渲染
+        // ==========================================
+        const targetOffset = new THREE.Vector3(0, 0, 0);
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            globalTimeSpeed = THREE.MathUtils.lerp(globalTimeSpeed, targetTimeSpeed, 0.1);
+            
+            if (dustSystem) {
+                dustSystem.rotation.y += 0.001 * globalTimeSpeed; 
+                const positions = dustSystem.geometry.attributes.position.array;
+                const time = Date.now() * 0.002;
+                for(let i=0; i<3000; i++) {
+                    positions[i*3+1] += Math.sin(time + positions[i*3]) * 0.3 * globalTimeSpeed; 
+                }
+                dustSystem.geometry.attributes.position.needsUpdate = true;
+            }
+
+            // 【核心优化】：如果锁定目标，彻底停止公转速度，只保留自身自转
+            const revolutionSpeed = isLocked ? 0 : globalTimeSpeed;
+
+            planetsData.forEach(p => {
+                p.orbitObj.rotation.y += p.speed * revolutionSpeed; // 公转 (锁定则为0)
+                p.mesh.rotation.y += 0.02 * globalTimeSpeed; // 自转保留
+                p.wireMesh.rotation.y -= 0.03 * globalTimeSpeed;
+                p.wireMesh.rotation.z += 0.01 * globalTimeSpeed;
+            });
+
+            let extraZoom = 1; 
+            if (isLocked) {
+                if (focusIndex === -2) {
+                    targetOffset.set(0,0,0);
+                    extraZoom = 3; 
+                } else {
+                    const p = planetsData[focusIndex];
+                    const v = new THREE.Vector3(p.dist, 0, 0);
+                    v.applyEuler(p.orbitObj.rotation);
+                    targetOffset.copy(v).negate(); 
+                    extraZoom = 8; 
+                }
+            } else {
+                // 如果未锁定，则应用双手的上下左右平移变量 (Pan)
+                targetOffset.set(targetPan.x, targetPan.y, 0); 
+                extraZoom = 1;
+            }
+
+            offsetGroup.position.lerp(targetOffset, 0.05); 
+            masterGroup.scale.setScalar(THREE.MathUtils.lerp(masterGroup.scale.x, targetScale * extraZoom, responsiveness));
+            masterGroup.rotation.x = THREE.MathUtils.lerp(masterGroup.rotation.x, targetRotation.x, responsiveness);
+            masterGroup.rotation.y = THREE.MathUtils.lerp(masterGroup.rotation.y, targetRotation.y, responsiveness);
+            masterGroup.rotation.z = THREE.MathUtils.lerp(masterGroup.rotation.z, targetRotation.z, responsiveness);
+            
+            renderer.render(scene, camera);
+        }
+
+        // ==========================================
+        // 5. 引擎启动
+        // ==========================================
+        const hands = new Hands({ locateFile: (file) => `https://unpkg.com/@mediapipe/hands@0.4.1646424915/${file}` });
+        hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.onResults(onResults);
+
+        async function start() {
+            statusText.innerText = ">> 引擎就绪！请点击屏幕任意位置唤醒系统 <<";
+            statusText.style.color = "#00ffcc";
+            
+            window.onclick = () => {
+                statusText.innerText = "正在接通光学传感器与 AI 核心...";
+                statusText.style.color = "white";
+                animate(); 
+
+                const camera_ai = new Camera(videoElement, {
+                    onFrame: async () => {
+                        await hands.send({image: videoElement});
+                    },
+                    width: 640,
+                    height: 480
+                });
+
+                camera_ai.start().then(() => {
+                    statusText.innerText = "全息阵列与手势追踪已完全激活！";
+                }).catch((err) => {
+                    statusText.innerText = "摄像头接入失败，请检查浏览器权限！";
+                    statusText.style.color = "#ff3366";
+                });
+            };
+        }
+        start();
+    </script>
+</body>
+</html>
